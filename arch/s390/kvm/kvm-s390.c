@@ -1092,8 +1092,6 @@ static int kvm_s390_vm_get_migration(struct kvm *kvm,
 	return 0;
 }
 
-static void __kvm_s390_set_tod_clock(struct kvm *kvm, const struct kvm_s390_vm_tod_clock *gtod);
-
 static int kvm_s390_set_tod_ext(struct kvm *kvm, struct kvm_device_attr *attr)
 {
 	struct kvm_s390_vm_tod_clock gtod;
@@ -1103,7 +1101,7 @@ static int kvm_s390_set_tod_ext(struct kvm *kvm, struct kvm_device_attr *attr)
 
 	if (!test_kvm_facility(kvm, 139) && gtod.epoch_idx)
 		return -EINVAL;
-	__kvm_s390_set_tod_clock(kvm, &gtod);
+	kvm_s390_set_tod_clock(kvm, &gtod);
 
 	VM_EVENT(kvm, 3, "SET: TOD extension: 0x%x, TOD base: 0x%llx",
 		gtod.epoch_idx, gtod.tod);
@@ -1134,7 +1132,7 @@ static int kvm_s390_set_tod_low(struct kvm *kvm, struct kvm_device_attr *attr)
 			   sizeof(gtod.tod)))
 		return -EFAULT;
 
-	__kvm_s390_set_tod_clock(kvm, &gtod);
+	kvm_s390_set_tod_clock(kvm, &gtod);
 	VM_EVENT(kvm, 3, "SET: TOD base: 0x%llx", gtod.tod);
 	return 0;
 }
@@ -1145,16 +1143,6 @@ static int kvm_s390_set_tod(struct kvm *kvm, struct kvm_device_attr *attr)
 
 	if (attr->flags)
 		return -EINVAL;
-
-	mutex_lock(&kvm->lock);
-	/*
-	 * For protected guests, the TOD is managed by the ultravisor, so trying
-	 * to change it will never bring the expected results.
-	 */
-	if (kvm_s390_pv_is_protected(kvm)) {
-		ret = -EOPNOTSUPP;
-		goto out_unlock;
-	}
 
 	switch (attr->attr) {
 	case KVM_S390_VM_TOD_EXT:
@@ -1170,9 +1158,6 @@ static int kvm_s390_set_tod(struct kvm *kvm, struct kvm_device_attr *attr)
 		ret = -ENXIO;
 		break;
 	}
-
-out_unlock:
-	mutex_unlock(&kvm->lock);
 	return ret;
 }
 
@@ -3877,12 +3862,14 @@ retry:
 	return 0;
 }
 
-static void __kvm_s390_set_tod_clock(struct kvm *kvm, const struct kvm_s390_vm_tod_clock *gtod)
+void kvm_s390_set_tod_clock(struct kvm *kvm,
+			    const struct kvm_s390_vm_tod_clock *gtod)
 {
 	struct kvm_vcpu *vcpu;
 	struct kvm_s390_tod_clock_ext htod;
 	int i;
 
+	mutex_lock(&kvm->lock);
 	preempt_disable();
 
 	get_tod_clock_ext((char *)&htod);
@@ -3903,15 +3890,7 @@ static void __kvm_s390_set_tod_clock(struct kvm *kvm, const struct kvm_s390_vm_t
 
 	kvm_s390_vcpu_unblock_all(kvm);
 	preempt_enable();
-}
-
-int kvm_s390_try_set_tod_clock(struct kvm *kvm, const struct kvm_s390_vm_tod_clock *gtod)
-{
-	if (!mutex_trylock(&kvm->lock))
-		return 0;
-	__kvm_s390_set_tod_clock(kvm, gtod);
 	mutex_unlock(&kvm->lock);
-	return 1;
 }
 
 /**

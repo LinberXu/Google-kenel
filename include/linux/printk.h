@@ -6,6 +6,7 @@
 #include <linux/init.h>
 #include <linux/kern_levels.h>
 #include <linux/linkage.h>
+#include <linux/cache.h>
 #include <linux/ratelimit_types.h>
 
 extern const char linux_banner[];

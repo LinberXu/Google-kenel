@@ -217,7 +217,6 @@ struct fixed_file_data {
 	struct completion		done;
 	struct list_head		ref_list;
 	spinlock_t			lock;
-	bool				quiesce;
 };
 
 struct io_buffer {
@@ -7101,79 +7100,41 @@ static void io_sqe_files_set_node(struct fixed_file_data *file_data,
 	percpu_ref_get(&file_data->refs);
 }
 
-
-static void io_sqe_files_kill_node(struct fixed_file_data *data)
+static int io_sqe_files_unregister(struct io_ring_ctx *ctx)
 {
-	struct fixed_file_ref_node *ref_node = NULL;
+	struct fixed_file_data *data = ctx->file_data;
+	struct fixed_file_ref_node *backup_node, *ref_node = NULL;
+	unsigned nr_tables, i;
+	int ret;
+
+	if (!data)
+		return -ENXIO;
+	backup_node = alloc_fixed_file_ref_node(ctx);
+	if (!backup_node)
+		return -ENOMEM;
 
 	spin_lock_bh(&data->lock);
 	ref_node = data->node;
 	spin_unlock_bh(&data->lock);
 	if (ref_node)
 		percpu_ref_kill(&ref_node->refs);
-}
 
-static int io_file_ref_quiesce(struct fixed_file_data *data,
-			       struct io_ring_ctx *ctx)
-{
-	int ret;
-	struct fixed_file_ref_node *backup_node;
+	percpu_ref_kill(&data->refs);
 
-	if (data->quiesce)
-		return -ENXIO;
-
-	data->quiesce = true;
+	/* wait for all refs nodes to complete */
+	flush_delayed_work(&ctx->file_put_work);
 	do {
-		backup_node = alloc_fixed_file_ref_node(ctx);
-		if (!backup_node)
-			break;
-
-		io_sqe_files_kill_node(data);
-		percpu_ref_kill(&data->refs);
-		flush_delayed_work(&ctx->file_put_work);
-
 		ret = wait_for_completion_interruptible(&data->done);
 		if (!ret)
 			break;
-
-		percpu_ref_resurrect(&data->refs);
-		io_sqe_files_set_node(data, backup_node);
-		backup_node = NULL;
-		reinit_completion(&data->done);
-		mutex_unlock(&ctx->uring_lock);
 		ret = io_run_task_work_sig();
-		mutex_lock(&ctx->uring_lock);
-
-		if (ret < 0)
-			break;
-		backup_node = alloc_fixed_file_ref_node(ctx);
-		ret = -ENOMEM;
-		if (!backup_node)
-			break;
+		if (ret < 0) {
+			percpu_ref_resurrect(&data->refs);
+			reinit_completion(&data->done);
+			io_sqe_files_set_node(data, backup_node);
+			return ret;
+		}
 	} while (1);
-	data->quiesce = false;
-
-	if (backup_node)
-		destroy_fixed_file_ref_node(backup_node);
-	return ret;
-}
-
-static int io_sqe_files_unregister(struct io_ring_ctx *ctx)
-{
-	struct fixed_file_data *data = ctx->file_data;
-	unsigned nr_tables, i;
-	int ret;
-
-	/*
-	 * percpu_ref_is_dying() is to stop parallel files unregister
-	 * Since we possibly drop uring lock later in this function to
-	 * run task work.
-	 */
-	if (!data || percpu_ref_is_dying(&data->refs))
-		return -ENXIO;
-	ret = io_file_ref_quiesce(data, ctx);
-	if (ret)
-		return ret;
 
 	__io_sqe_files_unregister(ctx);
 	nr_tables = DIV_ROUND_UP(ctx->nr_user_files, IORING_MAX_FILES_TABLE);
@@ -7184,6 +7145,7 @@ static int io_sqe_files_unregister(struct io_ring_ctx *ctx)
 	kfree(data);
 	ctx->file_data = NULL;
 	ctx->nr_user_files = 0;
+	destroy_fixed_file_ref_node(backup_node);
 	return 0;
 }
 
@@ -7334,7 +7296,6 @@ static int __io_sqe_files_scm(struct io_ring_ctx *ctx, int nr, int offset)
 	}
 
 	skb->sk = sk;
-	skb->scm_io_uring = 1;
 
 	nr_files = 0;
 	fpl->user = get_uid(ctx->user);
@@ -8470,6 +8431,8 @@ static void io_ring_ctx_free(struct io_ring_ctx *ctx)
 	if (ctx->sqo_task) {
 		put_task_struct(ctx->sqo_task);
 		ctx->sqo_task = NULL;
+		mmdrop(ctx->mm_account);
+		ctx->mm_account = NULL;
 	}
 
 #ifdef CONFIG_BLK_CGROUP
@@ -8477,9 +8440,7 @@ static void io_ring_ctx_free(struct io_ring_ctx *ctx)
 		css_put(ctx->sqo_blkcg_css);
 #endif
 
-	mutex_lock(&ctx->uring_lock);
 	io_sqe_files_unregister(ctx);
-	mutex_unlock(&ctx->uring_lock);
 	io_eventfd_unregister(ctx);
 	io_destroy_buffers(ctx);
 
@@ -8489,11 +8450,6 @@ static void io_ring_ctx_free(struct io_ring_ctx *ctx)
 		sock_release(ctx->ring_sock);
 	}
 #endif
-
-	if (ctx->mm_account) {
-		mmdrop(ctx->mm_account);
-		ctx->mm_account = NULL;
-	}
 
 	io_mem_free(ctx->rings);
 	io_mem_free(ctx->sq_sqes);

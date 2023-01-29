@@ -291,8 +291,7 @@ int dwc3_send_gadget_ep_cmd(struct dwc3_ep *dep, unsigned int cmd,
 	 *
 	 * DWC_usb3 3.30a and DWC_usb31 1.90a programming guide section 3.2.2
 	 */
-	if (dwc->gadget->speed <= USB_SPEED_HIGH ||
-	    DWC3_DEPCMD_CMD(cmd) == DWC3_DEPCMD_ENDTRANSFER) {
+	if (dwc->gadget->speed <= USB_SPEED_HIGH) {
 		reg = dwc3_readl(dwc->regs, DWC3_GUSB2PHYCFG(0));
 		if (unlikely(reg & DWC3_GUSB2PHYCFG_SUSPHY)) {
 			saved_config |= DWC3_GUSB2PHYCFG_SUSPHY;
@@ -332,17 +331,9 @@ int dwc3_send_gadget_ep_cmd(struct dwc3_ep *dep, unsigned int cmd,
 		}
 	}
 
-	/*
-	 * For some commands such as Update Transfer command, DEPCMDPARn
-	 * registers are reserved. Since the driver often sends Update Transfer
-	 * command, don't write to DEPCMDPARn to avoid register write delays and
-	 * improve performance.
-	 */
-	if (DWC3_DEPCMD_CMD(cmd) != DWC3_DEPCMD_UPDATETRANSFER) {
-		dwc3_writel(dep->regs, DWC3_DEPCMDPAR0, params->param0);
-		dwc3_writel(dep->regs, DWC3_DEPCMDPAR1, params->param1);
-		dwc3_writel(dep->regs, DWC3_DEPCMDPAR2, params->param2);
-	}
+	dwc3_writel(dep->regs, DWC3_DEPCMDPAR0, params->param0);
+	dwc3_writel(dep->regs, DWC3_DEPCMDPAR1, params->param1);
+	dwc3_writel(dep->regs, DWC3_DEPCMDPAR2, params->param2);
 
 	/*
 	 * Synopsys Databook 2.60a states in section 6.3.2.5.6 of that if we're
@@ -366,12 +357,6 @@ int dwc3_send_gadget_ep_cmd(struct dwc3_ep *dep, unsigned int cmd,
 		cmd |= DWC3_DEPCMD_CMDACT;
 
 	dwc3_writel(dep->regs, DWC3_DEPCMD, cmd);
-
-	if (!(cmd & DWC3_DEPCMD_CMDACT)) {
-		ret = 0;
-		goto skip_status;
-	}
-
 	do {
 		reg = dwc3_readl(dep->regs, DWC3_DEPCMD);
 		if (!(reg & DWC3_DEPCMD_CMDACT)) {
@@ -413,7 +398,6 @@ int dwc3_send_gadget_ep_cmd(struct dwc3_ep *dep, unsigned int cmd,
 		cmd_status = -ETIMEDOUT;
 	}
 
-skip_status:
 	trace_dwc3_gadget_ep_cmd(dep, cmd, params, cmd_status);
 
 	if (DWC3_DEPCMD_CMD(cmd) == DWC3_DEPCMD_STARTTRANSFER) {
@@ -967,7 +951,7 @@ out:
 	return 0;
 }
 
-static void dwc3_remove_requests(struct dwc3 *dwc, struct dwc3_ep *dep, int status)
+static void dwc3_remove_requests(struct dwc3 *dwc, struct dwc3_ep *dep)
 {
 	struct dwc3_request		*req;
 
@@ -977,19 +961,19 @@ static void dwc3_remove_requests(struct dwc3 *dwc, struct dwc3_ep *dep, int stat
 	while (!list_empty(&dep->started_list)) {
 		req = next_request(&dep->started_list);
 
-		dwc3_gadget_giveback(dep, req, status);
+		dwc3_gadget_giveback(dep, req, -ESHUTDOWN);
 	}
 
 	while (!list_empty(&dep->pending_list)) {
 		req = next_request(&dep->pending_list);
 
-		dwc3_gadget_giveback(dep, req, status);
+		dwc3_gadget_giveback(dep, req, -ESHUTDOWN);
 	}
 
 	while (!list_empty(&dep->cancelled_list)) {
 		req = next_request(&dep->cancelled_list);
 
-		dwc3_gadget_giveback(dep, req, status);
+		dwc3_gadget_giveback(dep, req, -ESHUTDOWN);
 	}
 }
 
@@ -1018,17 +1002,17 @@ static int __dwc3_gadget_ep_disable(struct dwc3_ep *dep)
 	reg &= ~DWC3_DALEPENA_EP(dep->number);
 	dwc3_writel(dwc->regs, DWC3_DALEPENA, reg);
 
-	dwc3_remove_requests(dwc, dep, -ESHUTDOWN);
-
-	dep->stream_capable = false;
-	dep->type = 0;
-	dep->flags &= DWC3_EP_TXFIFO_RESIZED;
-
 	/* Clear out the ep descriptors for non-ep0 */
 	if (dep->number > 1) {
 		dep->endpoint.comp_desc = NULL;
 		dep->endpoint.desc = NULL;
 	}
+
+	dwc3_remove_requests(dwc, dep);
+
+	dep->stream_capable = false;
+	dep->type = 0;
+	dep->flags &= DWC3_EP_TXFIFO_RESIZED;
 
 	return 0;
 }
@@ -1279,8 +1263,8 @@ static void dwc3_prepare_one_trb(struct dwc3_ep *dep,
 			trb->ctrl = DWC3_TRBCTL_ISOCHRONOUS;
 		}
 
-		if (!no_interrupt && !chain)
-			trb->ctrl |= DWC3_TRB_CTRL_ISP_IMI;
+		/* always enable Interrupt on Missed ISOC */
+		trb->ctrl |= DWC3_TRB_CTRL_ISP_IMI;
 		break;
 
 	case USB_ENDPOINT_XFER_BULK:
@@ -1655,40 +1639,6 @@ static int __dwc3_gadget_get_frame(struct dwc3 *dwc)
 }
 
 /**
- * __dwc3_stop_active_transfer - stop the current active transfer
- * @dep: isoc endpoint
- * @force: set forcerm bit in the command
- * @interrupt: command complete interrupt after End Transfer command
- *
- * When setting force, the ForceRM bit will be set. In that case
- * the controller won't update the TRB progress on command
- * completion. It also won't clear the HWO bit in the TRB.
- * The command will also not complete immediately in that case.
- */
-static int __dwc3_stop_active_transfer(struct dwc3_ep *dep, bool force, bool interrupt)
-{
-	struct dwc3_gadget_ep_cmd_params params;
-	u32 cmd;
-	int ret;
-
-	cmd = DWC3_DEPCMD_ENDTRANSFER;
-	cmd |= force ? DWC3_DEPCMD_HIPRI_FORCERM : 0;
-	cmd |= interrupt ? DWC3_DEPCMD_CMDIOC : 0;
-	cmd |= DWC3_DEPCMD_PARAM(dep->resource_index);
-	memset(&params, 0, sizeof(params));
-	ret = dwc3_send_gadget_ep_cmd(dep, cmd, &params);
-	WARN_ON_ONCE(ret);
-	dep->resource_index = 0;
-
-	if (!interrupt)
-		dep->flags &= ~DWC3_EP_TRANSFER_STARTED;
-	else if (!ret)
-		dep->flags |= DWC3_EP_END_TRANSFER_PENDING;
-
-	return ret;
-}
-
-/**
  * dwc3_gadget_start_isoc_quirk - workaround invalid frame number
  * @dep: isoc endpoint
  *
@@ -1863,8 +1813,21 @@ static int __dwc3_gadget_start_isoc(struct dwc3_ep *dep)
 	 * status, issue END_TRANSFER command and retry on the next XferNotReady
 	 * event.
 	 */
-	if (ret == -EAGAIN)
-		ret = __dwc3_stop_active_transfer(dep, false, true);
+	if (ret == -EAGAIN) {
+		struct dwc3_gadget_ep_cmd_params params;
+		u32 cmd;
+
+		cmd = DWC3_DEPCMD_ENDTRANSFER |
+			DWC3_DEPCMD_CMDIOC |
+			DWC3_DEPCMD_PARAM(dep->resource_index);
+
+		dep->resource_index = 0;
+		memset(&params, 0, sizeof(params));
+
+		ret = dwc3_send_gadget_ep_cmd(dep, cmd, &params);
+		if (!ret)
+			dep->flags |= DWC3_EP_END_TRANSFER_PENDING;
+	}
 
 	return ret;
 }
@@ -1922,11 +1885,13 @@ static int __dwc3_gadget_ep_queue(struct dwc3_ep *dep, struct dwc3_request *req)
 	 * errors which will force us issue EndTransfer command.
 	 */
 	if (usb_endpoint_xfer_isoc(dep->endpoint.desc)) {
-		if (!(dep->flags & DWC3_EP_TRANSFER_STARTED)) {
-			if ((dep->flags & DWC3_EP_PENDING_REQUEST))
-				return __dwc3_gadget_start_isoc(dep);
-
+		if (!(dep->flags & DWC3_EP_PENDING_REQUEST) &&
+				!(dep->flags & DWC3_EP_TRANSFER_STARTED))
 			return 0;
+
+		if ((dep->flags & DWC3_EP_PENDING_REQUEST)) {
+			if (!(dep->flags & DWC3_EP_TRANSFER_STARTED))
+				return __dwc3_gadget_start_isoc(dep);
 		}
 	}
 
@@ -2045,6 +2010,16 @@ static int dwc3_gadget_ep_dequeue(struct usb_ep *ep,
 	list_for_each_entry(r, &dep->started_list, list) {
 		if (r == req) {
 			struct dwc3_request *t;
+
+			/*
+			 * If a Setup packet is received but yet to DMA out, the controller will
+			 * not process the End Transfer command of any endpoint. Polling of its
+			 * DEPCMD.CmdAct may block setting up TRB for Setup packet, causing a
+			 * timeout. Delay issuing the End Transfer command until the Setup TRB is
+			 * prepared.
+			 */
+			if (dwc->ep0state != EP0_SETUP_PHASE && !dwc->delayed_status)
+				dep->flags |= DWC3_EP_DELAY_STOP;
 
 			/* wait until it is processed */
 			dwc3_stop_active_transfer(dep, true, true);
@@ -2327,7 +2302,7 @@ static void dwc3_stop_active_transfers(struct dwc3 *dwc)
 		if (!dep)
 			continue;
 
-		dwc3_remove_requests(dwc, dep, -ESHUTDOWN);
+		dwc3_remove_requests(dwc, dep);
 	}
 }
 
@@ -2485,23 +2460,6 @@ static int dwc3_gadget_soft_disconnect(struct dwc3 *dwc)
 	dwc->connected = false;
 
 	/*
-	 * Per databook, when we want to stop the gadget, if a control transfer
-	 * is still in process, complete it and get the core into setup phase.
-	 */
-	if (dwc->ep0state != EP0_SETUP_PHASE) {
-		int ret;
-
-		reinit_completion(&dwc->ep0_in_setup);
-
-		spin_unlock_irqrestore(&dwc->lock, flags);
-		ret = wait_for_completion_timeout(&dwc->ep0_in_setup,
-				msecs_to_jiffies(DWC3_PULL_UP_TIMEOUT));
-		spin_lock_irqsave(&dwc->lock, flags);
-		if (ret == 0)
-			dev_warn(dwc->dev, "timed out waiting for SETUP phase\n");
-	}
-
-	/*
 	 * In the Synopsys DesignWare Cores USB3 Databook Rev. 3.30a
 	 * Section 4.1.8 Table 4-7, it states that for a device-initiated
 	 * disconnect, the SW needs to ensure that it sends "a DEPENDXFER
@@ -2531,6 +2489,19 @@ static int dwc3_gadget_pullup(struct usb_gadget *g, int is_on)
 	is_on = !!is_on;
 
 	vdwc->softconnect = is_on;
+
+	/*
+	 * Per databook, when we want to stop the gadget, if a control transfer
+	 * is still in process, complete it and get the core into setup phase.
+	 */
+	if (!is_on && dwc->ep0state != EP0_SETUP_PHASE) {
+		reinit_completion(&dwc->ep0_in_setup);
+
+		ret = wait_for_completion_timeout(&dwc->ep0_in_setup,
+				msecs_to_jiffies(DWC3_PULL_UP_TIMEOUT));
+		if (ret == 0)
+			dev_warn(dwc->dev, "timed out waiting for SETUP phase\n");
+	}
 
 	/*
 	 * Avoid issuing a runtime resume if the device is already in the
@@ -2966,7 +2937,6 @@ static int dwc3_gadget_init_in_endpoint(struct dwc3_ep *dep)
 	struct dwc3 *dwc = dep->dwc;
 	u32 mdwidth;
 	int size;
-	int maxpacket;
 
 	mdwidth = dwc3_mdwidth(dwc);
 
@@ -2979,24 +2949,21 @@ static int dwc3_gadget_init_in_endpoint(struct dwc3_ep *dep)
 	else
 		size = DWC31_GTXFIFOSIZ_TXFDEP(size);
 
-	/*
-	 * maxpacket size is determined as part of the following, after assuming
-	 * a mult value of one maxpacket:
-	 * DWC3 revision 280A and prior:
-	 * fifo_size = mult * (max_packet / mdwidth) + 1;
-	 * maxpacket = mdwidth * (fifo_size - 1);
-	 *
-	 * DWC3 revision 290A and onwards:
-	 * fifo_size = mult * ((max_packet + mdwidth)/mdwidth + 1) + 1
-	 * maxpacket = mdwidth * ((fifo_size - 1) - 1) - mdwidth;
-	 */
-	if (DWC3_VER_IS_PRIOR(DWC3, 290A))
-		maxpacket = mdwidth * (size - 1);
-	else
-		maxpacket = mdwidth * ((size - 1) - 1) - mdwidth;
+	/* FIFO Depth is in MDWDITH bytes. Multiply */
+	size *= mdwidth;
 
-	/* Functionally, space for one max packet is sufficient */
-	size = min_t(int, maxpacket, 1024);
+	/*
+	 * To meet performance requirement, a minimum TxFIFO size of 3x
+	 * MaxPacketSize is recommended for endpoints that support burst and a
+	 * minimum TxFIFO size of 2x MaxPacketSize for endpoints that don't
+	 * support burst. Use those numbers and we can calculate the max packet
+	 * limit as below.
+	 */
+	if (dwc->maximum_speed >= USB_SPEED_SUPER)
+		size /= 3;
+	else
+		size /= 2;
+
 	usb_ep_set_maxpacket_limit(&dep->endpoint, size);
 
 	dep->endpoint.max_streams = 16;
@@ -3210,10 +3177,6 @@ static int dwc3_gadget_ep_reclaim_completed_trb(struct dwc3_ep *dep,
 		return 1;
 
 	if (event->status & DEPEVT_STATUS_SHORT && !chain)
-		return 1;
-
-	if ((trb->ctrl & DWC3_TRB_CTRL_ISP_IMI) &&
-	    DWC3_TRB_SIZE_TRBSTS(trb->size) == DWC3_TRBSTS_MISSED_ISOC)
 		return 1;
 
 	if ((trb->ctrl & DWC3_TRB_CTRL_IOC) ||
@@ -3672,33 +3635,14 @@ static void dwc3_reset_gadget(struct dwc3 *dwc)
 void dwc3_stop_active_transfer(struct dwc3_ep *dep, bool force,
 	bool interrupt)
 {
-	struct dwc3 *dwc = dep->dwc;
-
-	/*
-	 * Only issue End Transfer command to the control endpoint of a started
-	 * Data Phase. Typically we should only do so in error cases such as
-	 * invalid/unexpected direction as described in the control transfer
-	 * flow of the programming guide.
-	 */
-	if (dep->number <= 1 && dwc->ep0state != EP0_DATA_PHASE)
-		return;
+	struct dwc3_gadget_ep_cmd_params params;
+	u32 cmd;
+	int ret;
 
 	if (!(dep->flags & DWC3_EP_TRANSFER_STARTED) ||
 	    (dep->flags & DWC3_EP_DELAY_STOP) ||
 	    (dep->flags & DWC3_EP_END_TRANSFER_PENDING))
 		return;
-
-	/*
-	 * If a Setup packet is received but yet to DMA out, the controller will
-	 * not process the End Transfer command of any endpoint. Polling of its
-	 * DEPCMD.CmdAct may block setting up TRB for Setup packet, causing a
-	 * timeout. Delay issuing the End Transfer command until the Setup TRB is
-	 * prepared.
-	 */
-	if (dwc->ep0state != EP0_SETUP_PHASE && !dwc->delayed_status) {
-		dep->flags |= DWC3_EP_DELAY_STOP;
-		return;
-	}
 
 	/*
 	 * NOTICE: We are violating what the Databook says about the
@@ -3726,7 +3670,20 @@ void dwc3_stop_active_transfer(struct dwc3_ep *dep, bool force,
 	 *
 	 * This mode is NOT available on the DWC_usb31 IP.
 	 */
-	__dwc3_stop_active_transfer(dep, force, interrupt);
+
+	cmd = DWC3_DEPCMD_ENDTRANSFER;
+	cmd |= force ? DWC3_DEPCMD_HIPRI_FORCERM : 0;
+	cmd |= interrupt ? DWC3_DEPCMD_CMDIOC : 0;
+	cmd |= DWC3_DEPCMD_PARAM(dep->resource_index);
+	memset(&params, 0, sizeof(params));
+	ret = dwc3_send_gadget_ep_cmd(dep, cmd, &params);
+	WARN_ON_ONCE(ret);
+	dep->resource_index = 0;
+
+	if (!interrupt)
+		dep->flags &= ~DWC3_EP_TRANSFER_STARTED;
+	else
+		dep->flags |= DWC3_EP_END_TRANSFER_PENDING;
 }
 EXPORT_SYMBOL_GPL(dwc3_stop_active_transfer);
 
@@ -4229,6 +4186,7 @@ static irqreturn_t dwc3_process_event_buf(struct dwc3_event_buffer *evt)
 	struct dwc3 *dwc = evt->dwc;
 	irqreturn_t ret = IRQ_NONE;
 	int left;
+	u32 reg;
 
 	left = evt->count;
 
@@ -4259,8 +4217,9 @@ static irqreturn_t dwc3_process_event_buf(struct dwc3_event_buffer *evt)
 	ret = IRQ_HANDLED;
 
 	/* Unmask interrupt */
-	dwc3_writel(dwc->regs, DWC3_GEVNTSIZ(0),
-		    DWC3_GEVNTSIZ_SIZE(evt->length));
+	reg = dwc3_readl(dwc->regs, DWC3_GEVNTSIZ(0));
+	reg &= ~DWC3_GEVNTSIZ_INTMASK;
+	dwc3_writel(dwc->regs, DWC3_GEVNTSIZ(0), reg);
 
 	if (dwc->imod_interval) {
 		dwc3_writel(dwc->regs, DWC3_GEVNTCOUNT(0), DWC3_GEVNTCOUNT_EHB);
@@ -4294,6 +4253,7 @@ static irqreturn_t dwc3_check_event_buf(struct dwc3_event_buffer *evt)
 	struct dwc3 *dwc = evt->dwc;
 	u32 amount;
 	u32 count;
+	u32 reg;
 
 	if (pm_runtime_suspended(dwc->dev)) {
 		pm_runtime_get(dwc->dev);
@@ -4320,8 +4280,9 @@ static irqreturn_t dwc3_check_event_buf(struct dwc3_event_buffer *evt)
 	evt->flags |= DWC3_EVENT_PENDING;
 
 	/* Mask interrupt */
-	dwc3_writel(dwc->regs, DWC3_GEVNTSIZ(0),
-		    DWC3_GEVNTSIZ_INTMASK | DWC3_GEVNTSIZ_SIZE(evt->length));
+	reg = dwc3_readl(dwc->regs, DWC3_GEVNTSIZ(0));
+	reg |= DWC3_GEVNTSIZ_INTMASK;
+	dwc3_writel(dwc->regs, DWC3_GEVNTSIZ(0), reg);
 
 	amount = min(count, evt->length - evt->lpos);
 	memcpy(evt->cache + evt->lpos, evt->buf + evt->lpos, amount);
